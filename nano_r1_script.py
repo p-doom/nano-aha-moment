@@ -9,6 +9,7 @@ import argparse
 import gc
 import re
 import time
+from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Dict, List, Tuple, Union
 
 import deepspeed
@@ -20,7 +21,6 @@ from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from vllm import LLM, SamplingParams
 
-import wandb
 from utils import (
     compute_token_log_probs,
     dump_episodes,
@@ -374,7 +374,7 @@ def main():
     # Batch size for each GPU device during training
     PER_DEVICE_BATCH_SIZE = 4
     # Learning rate for model updates
-    LEARNING_RATE = 1e-6
+    LEARNING_RATE = args.learning_rate
 
     # Sampling parameters
     # Maximum number of tokens to generate in each response
@@ -504,20 +504,12 @@ def main():
         enable_sleep_mode=True,
     )
 
-    # Wandb for logging
-    wandb.init(
-        project="r1-aha-moment",
-        name=RUN_NAME,
-        config={
-            "model_name": MODEL_NAME,
-            "learning_rate": LEARNING_RATE,
-            "num_iterations": NUM_ITERATIONS,
-            "episodes_per_iteration": EPISODES_PER_ITERATION,
-            "rollouts_per_episode": GENERATIONS_PER_SAMPLE,
-            "kl_coefficient": KL_COEFFICIENT,
-            "temperature": TEMPERATURE,
-        },
-    )
+    # Configure TensorBoard logger
+    tensorboard_log_dir = EXP_DIR / "tensorboard_logs"
+    tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=tensorboard_log_dir) # Changed
+    print(f"TensorBoard logs will be saved to: {tensorboard_log_dir}")
+
 
     # Load checkpoint if it exists
     begin_iter = 0
@@ -556,7 +548,7 @@ def main():
                 ),
                 reward_func=lambda completion, sample: compute_reward(completion, sample, EOS_TOKEN),
             )
-            eval_episode_table = dump_episodes(
+            dump_episodes(
                 episodes=eval_episodes,
                 episodes_stats=eval_stats,
                 exp_dir=EXP_DIR,
@@ -564,7 +556,8 @@ def main():
                 iteration=iteration,
                 is_eval=True,
             )
-            wandb.log({"eval/episodes": eval_episode_table, "iteration": iteration})
+            for k, v in eval_stats.items():
+                writer.add_scalar(f"eval/{k}", np.mean(v), iteration)
 
         #########################################################
         # Generate Episodes
@@ -614,7 +607,7 @@ def main():
         for k, v in episodes_stats.items():
             metrics.setdefault(k, []).extend(v)
 
-        episode_table = dump_episodes(
+        dump_episodes(
             episodes=episodes,
             episodes_stats=episodes_stats,
             exp_dir=EXP_DIR,
@@ -694,35 +687,29 @@ def main():
         load_model_into_vllm(policy_model, inference_engine)
 
         #########################################################
-        # Log metrics
+        # Log metrics to TensorBoard
         #########################################################
 
-        train_metrics = {k: np.mean(v) for k, v in metrics.items() if None not in v}
+        train_metrics = {k: np.mean(v) for k, v in metrics.items() if v and None not in v}
         train_metrics["learning_rate"] = policy_model.get_lr()[0]
-        logs = {
-            "iteration": iteration,
-            f"episodes/iter_{iteration:06d}": episode_table,
-            **{f"train/{k}": v for k, v in train_metrics.items()},
-        }
-        if eval_stats is not None:
-            logs.update({f"eval/{k}": np.mean(v) for k, v in eval_stats.items()})
-        wandb.log(logs)
 
-        selected_keys = [
-            "train/kl_penalty",
-            "train/rewards",
-            "train/reward_metrics/format_reward",
-            "train/reward_metrics/equation_reward",
-            "eval/rewards",
-            "eval/reward_metrics/format_reward",
-            "eval/reward_metrics/equation_reward",
-        ]
-        selected_metrics = {k: logs[k] for k in selected_keys if k in logs}
-        print(f"KEY METRICS: {selected_metrics}")
+        print_metrics = {k: train_metrics.get(k.split('/')[1], 'N/A') for k in selected_keys if k.startswith("train/")}
+        if eval_stats is not None:
+             print_metrics.update({k: np.mean(eval_stats.get(k.split('/')[1], [np.nan])) for k in selected_keys if k.startswith("eval/")})
+
+        print(f"KEY METRICS (Iter {iteration}): {print_metrics}")
+
 
         if iteration % 50 == 0 and iteration != 0:
-            policy_model.module.save_pretrained(str(EXP_DIR / "checkpoints" / f"ckpt_{iteration:06d}" / "hf_model"))
-            policy_model.save_checkpoint(str(EXP_DIR / "checkpoints" / f"ckpt_{iteration:06d}" / "deepspeed"))
+            hf_save_dir = EXP_DIR / "checkpoints" / f"ckpt_{iteration:06d}" / "hf_model"
+            hf_save_dir.mkdir(parents=True, exist_ok=True)
+            policy_model.module.save_pretrained(str(hf_save_dir))
+
+            # Save DeepSpeed checkpoint
+            ds_save_dir = EXP_DIR / "checkpoints" / f"ckpt_{iteration:06d}" / "deepspeed"
+            policy_model.save_checkpoint(str(ds_save_dir))
+
+    writer.close()
 
 
 if __name__ == "__main__":

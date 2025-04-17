@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-import wandb
 from datasets import Dataset
 from deepspeed import DeepSpeedEngine
 from transformers import AutoTokenizer, PreTrainedModel
@@ -267,7 +266,7 @@ def dump_episodes(
     tokenizer: AutoTokenizer,
     iteration: int,
     is_eval: bool = False,
-) -> wandb.Table:
+) -> None:
     query_token_ids = episodes["all_query_token_ids"]
     response_token_ids = episodes["all_response_token_ids"]
     rewards = episodes_stats["rewards"]
@@ -304,22 +303,19 @@ def dump_episodes(
                     "query": query_texts[i],
                     "response": response_texts[i],
                     "reward": rewards[i],
+                    "response_length": response_lengths[i],
                 }
                 for i in range(len(query_texts))
             ],
             f,
+            indent=2
         )
-
-    # Create wandb table
-    table = wandb.Table(columns=["query", "response", "reward", "response_length"])
-    for i in range(len(query_texts)):
-        table.add_data(query_texts[i], response_texts[i], rewards[i], response_lengths[i])
-
-    return table
 
 
 def find_last_checkpoint(exp_dir: Path) -> Tuple[Optional[Path], Optional[int]]:
     checkpoint_dir = exp_dir / "checkpoints"
+    if not checkpoint_dir.exists():
+        return None, None
     checkpoints = list(checkpoint_dir.glob("ckpt_*"))
     # Filter out directories that don't have a deepspeed subdirectory
     checkpoints = [ckpt for ckpt in checkpoints if (ckpt / "deepspeed").exists()]
